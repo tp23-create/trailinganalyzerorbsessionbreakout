@@ -1,0 +1,1162 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// ORB Session Breakout Strategy v2.8 (Tick-Sync & Native Brackets) - Updated with EOD Close & Extra NY Sessions (+ NY 20:00, High-Risk Skip, Audit Fixes v8, + 2-Tick Trail Method)
+
+// v9 (NinjaScript 1.4 match): entries only when flat, stop measured from the fill, trail distance = max(trail ticks,
+//    Stop Safety Margin) like NinjaScript, no new entries from EOD close until 18:00, trades carry into the next session,
+//    decisions on bar close, commission 0.65 per contract.
+
+//@version=5
+strategy("ORB Session Breakout Strategy", "ORB Session Breakout", overlay = true, max_labels_count = 500, max_lines_count = 500, max_boxes_count = 500, initial_capital = 100000, default_qty_type = strategy.fixed, default_qty_value = 1, margin_long = 0, margin_short = 0, pyramiding = 1, process_orders_on_close = true, calc_on_every_tick = false, calc_on_order_fills = false, commission_type = strategy.commission.cash_per_contract, commission_value = 0.65)
+
+// ============================================================
+// HELPER FUNCTIONS
+// ============================================================
+get_line_style(_style) =>
+    result = switch _style
+        'Solid' => line.style_solid
+        'Dotted' => line.style_dotted
+        'Dashed' => line.style_dashed
+    result
+
+get_size(x) =>
+    result = switch x
+        'Auto' => size.auto
+        'Tiny' => size.tiny
+        'Small' => size.small
+        'Normal' => size.normal
+        'Large' => size.large
+        'Huge' => size.huge
+    result
+
+// ============================================================
+// SECTION 1: RISK MANAGEMENT (FUTURES)
+// ============================================================
+var g_RISK          = "🛡️ Risk Management (Futures)"
+i_risk_usd          = input.float(350.0, "Risk Per Trade ($)", tooltip = "Fixed USD amount to risk per trade", group = g_RISK)
+i_max_contracts     = input.int(120, "Max Contracts Limit", minval = 1, tooltip = "Maximum number of contracts to trade regardless of risk limit", group = g_RISK)
+i_min_contracts     = input.int(1, "Min Contracts Default", minval = 1, tooltip = "Ensures at least this many contracts are taken so the strategy always fires", group = g_RISK)
+i_skip_high_risk    = input.bool(true, "Skip Trade if Risk Too High", tooltip = "If even 1 contract risks more than 'Risk Per Trade ($)', the trade is skipped instead of forcing the minimum contract. Trades that fit within the risk are unaffected.", group = g_RISK)
+
+// ============================================================
+// SECTION 2: DISPLAY SETTINGS
+// ============================================================
+var g_DISPLAY       = "⚙️ Display Settings"
+i_timezone          = input.string("America/New_York", "Timezone", options = ["America/New_York", "GMT-12", "GMT-11", "GMT-10", "GMT-9", "GMT-8", "GMT-7", "GMT-6", "GMT-5", "GMT-4", "GMT-3", "GMT-2", "GMT-1", "GMT+0", "GMT+1", "GMT+2", "GMT+3", "GMT+4", "GMT+5", "GMT+6", "GMT+7", "GMT+8", "GMT+9", "GMT+10", "GMT+11", "GMT+12"], group = g_DISPLAY)
+lbl_size            = get_size(input.string('Small', "Label Size", options = ['Auto', 'Tiny', 'Small', 'Normal', 'Large', 'Huge'], group = g_DISPLAY))
+txt_color           = input.color(color.black, "Text Color", group = g_DISPLAY)
+max_days            = input.int(50, "Max Session Drawings", 1, 100, tooltip = "Number of past sessions to keep on chart", group = g_DISPLAY)
+tf_limit            = input.timeframe("60", "Max Timeframe", tooltip = "Hide drawings on timeframes larger than this", group = g_DISPLAY)
+
+// ORB Timeframe Lock
+use_orb_tf_lock     = input.bool(true, "Lock ORB Timeframe", inline = "orb_tf", group = g_DISPLAY, tooltip = "When enabled, ORB levels are always calculated on the locked timeframe below, regardless of chart timeframe.")
+orb_tf_lock         = input.timeframe("15", "ORB Timeframe", inline = "orb_tf", group = g_DISPLAY, tooltip = "The timeframe used to form the ORB range (e.g. '5' = 5-minute ORB). Only active when Lock ORB Timeframe is enabled.")
+
+// ============================================================
+// SECTION 3: TRADE VISUALIZATION
+// ============================================================
+var g_TRADE_VIZ     = "📊 Trade Visualization"
+show_trade_lines    = input.bool(true, "Show SL/TP Lines", inline = "trade_show1", group = g_TRADE_VIZ)
+show_trade_labels   = input.bool(false, "Show Labels", inline = "trade_show1", tooltip = "Show Entry/SL/TP price labels", group = g_TRADE_VIZ)
+show_tp_fill        = input.bool(true, "Show TP Zone", inline = "trade_show2", group = g_TRADE_VIZ)
+show_sl_fill        = input.bool(true, "Show SL Zone", inline = "trade_show2", group = g_TRADE_VIZ)
+max_trade_bars      = input.int(20, "Max Trade Bars", minval = 5, maxval = 100, tooltip = "Maximum bars to extend SL/TP lines and boxes", group = g_TRADE_VIZ)
+entry_color         = input.color(color.black, "Entry", inline = "trade_col", group = g_TRADE_VIZ)
+sl_line_color       = input.color(color.red, "SL", inline = "trade_col", group = g_TRADE_VIZ)
+tp_line_color       = input.color(#2962ff, "TP", inline = "trade_col", group = g_TRADE_VIZ)
+sl_zone_color       = input.color(color.new(color.red, 85), "SL Zone", inline = "trade_col2", group = g_TRADE_VIZ)
+tp_zone_color       = input.color(color.new(#2962ff, 85), "TP Zone", inline = "trade_col2", group = g_TRADE_VIZ)
+show_entry_labels   = input.bool(false, "Show Entry Labels (LONG/SHORT)", group = g_TRADE_VIZ)
+highlight_breakout  = input.bool(true, "Highlight Breakout Candle", inline = "breakout", group = g_TRADE_VIZ)
+breakout_candle_col = input.color(color.yellow, "", inline = "breakout", group = g_TRADE_VIZ)
+
+var trade_line_width = 1
+
+// ============================================================
+// SECTION 4: TRADE SETTINGS
+// ============================================================
+var g_TRADE         = "💰 Trade Settings"
+max_breakouts       = input.int(2, "Max Breakouts", 1, 4, tooltip = "Maximum number of breakout trades per session", group = g_TRADE)
+sl_mode             = input.string("Breakout Candle", "Stop Loss Mode", options = ["ORB Level", "Breakout Candle"], tooltip = "ORB Level: SL at ORB High/Low\nBreakout Candle: SL at breakout candle High/Low", group = g_TRADE)
+close_on_new_orb    = input.bool(true, "Close Trades on New ORB Session", tooltip = "Close any active strategy position when a new ORB session begins", group = g_TRADE)
+use_strong_first    = input.bool(true, "Enter on Strong 1st Candle After ORB", tooltip = "ON = the first candle right after the ORB can enter immediately, but ONLY if it closes strongly outside the range (see % below). Weaker first candles are ignored as before. Works on every chart timeframe.", group = g_TRADE)
+strong_first_pct    = input.float(50.0, "Strong Candle % Beyond ORB", minval = 1, maxval = 100, step = 5, tooltip = "How much of the first candle must be beyond the ORB level at the close. 50 = half the candle closed outside the range. Use 70 or 80 for only very strong candles.", group = g_TRADE)
+strong_first_mode   = input.string("Candle Body", "Measure Strength By", options = ["Candle Body", "Full Candle"], tooltip = "Candle Body: only open-to-close counts, wicks are ignored. Long: (Close - ORB High) / (Close - Open). Short: (ORB Low - Close) / (Open - Close). A candle that opened outside the range counts as 100%.\nFull Candle: high-to-low counts, so long wicks make the candle weaker.", group = g_TRADE)
+show_strong_info    = input.bool(true, "Show 1st Candle Strength Label", tooltip = "Shows the measured % on the first candle after the ORB when it closes outside the range (STRONG = entered, WEAK = not strong enough).", group = g_TRADE)
+
+enable_eod_close    = input.bool(true, "Close 15m Before Market Close", group = g_TRADE)
+eod_close_session   = input.session("1645-1700", "EOD Close Time", tooltip = "Same as NinjaScript Flatten Time (16:40). No new entries from this time until 18:00 NY.", group = g_TRADE)
+
+// TP Settings
+tp_mode             = input.string("Risk:Reward", "Take Profit Mode", options = ["Risk:Reward", "Fixed Points/Ticks", "Fixed %"], group = g_TRADE)
+rr_ratio            = input.float(2.0, "Risk:Reward Ratio", 0.5, 10, 0.5, tooltip = "Target size as multiple of stop loss", group = g_TRADE)
+tp_ticks            = input.int(50, "Fixed TP (Ticks/Points)", minval = 1, tooltip = "Only used if TP Mode is 'Fixed Points/Ticks'", group = g_TRADE)
+tp_percent          = input.float(1.0, "Fixed TP (%)", minval = 0.1, step = 0.1, tooltip = "Only used if TP Mode is 'Fixed %'", group = g_TRADE)
+
+// Trailing Stop Settings
+use_trail           = input.bool(false, "Enable Trailing Stop", group = g_TRADE)
+trail_act_r         = input.float(0.3, "Trail Activation (R-Multiple)", minval=0.1, step=0.1, tooltip="Profit required (in multiples of your risk) before trail starts. 0.5 means trail activates at 0.5R profit.", group = g_TRADE)
+trail_offset_r      = input.float(0.1, "Trail Offset (R-Multiple)", minval=0.05, step=0.05, tooltip="Distance to trail behind the highest profit (in multiples of your risk).", group = g_TRADE)
+trail_rm_limit      = input.bool(false, "Remove Hard TP when Trailing", tooltip="Allows trades to run infinitely until stopped out by trail. Applies to both trailing methods.", group = g_TRADE)
+
+// 2-Tick Trailing Method (NEW) - when ON it is used INSTEAD of the trailing stop above
+var g_2TICK         = "🎯 2-Tick Trailing Method"
+use_2tick           = input.bool(true, "Enable Trailing Stop? (2-Tick Method)", tooltip = "ON = this method is used and the 'Enable Trailing Stop' settings above are ignored.\nOFF = the original trailing stop above is used (or the TP if that is OFF too).", group = g_2TICK)
+tick_act_r          = input.float(0.35, "Start Trailing At (Risk Multiplier)", minval = 0.05, step = 0.05, tooltip = "Trail starts when price moves this many R from the entry price.", group = g_2TICK)
+tick_off_ticks      = input.int(2, "Trail Behind By (Ticks)", minval = 1, tooltip = "Fixed distance in ticks between the best price reached and the trailing stop.", group = g_2TICK)
+min_stop_ticks      = input.int(20, "Minimum Stop Distance (Ticks)", minval = 0, tooltip = "Only used when the 2-Tick Method is ON. Setups with a stop smaller than this are skipped (the trail would start right at entry). 0 = off.", group = g_2TICK)
+stop_margin_ticks   = input.int(4, "Stop Safety Margin (Ticks) = NinjaScript", minval = 0, tooltip = "Must be the same as NinjaScript 'Stop Safety Margin'. The live NinjaScript stop is never closer than this to the price, so the real trail distance = the larger of 'Trail Behind By' and this value.", group = g_2TICK)
+lock_ticks          = input.int(2, "Lock Profit When Started (Ticks)", minval = 0, tooltip = "When the trail starts, the stop is at least entry + this many ticks. If 0.3R is too small for that, the trail start is pushed further out so the lock is always guaranteed.", group = g_2TICK)
+
+// ============================================================
+// SECTION 5: ORB SESSION
+// ============================================================
+var g_ORB           = "📦 ORB Session"
+show_orb_box        = input.bool(true, "Show ORB Box", inline = "orb_show", group = g_ORB)
+show_orb_text       = input.bool(true, "Display Text", inline = "orb_show", group = g_ORB)
+
+use_asia            = input.bool(true, "", inline = "ASIA", group = g_ORB)
+asia_txt            = input.string("Asia ORB", "", inline = "ASIA", group = g_ORB)
+asia_session        = input.session("2000-2015", "", inline = "ASIA", group = g_ORB)
+asia_color          = input.color(color.blue, "", inline = "ASIA", group = g_ORB)
+
+use_london          = input.bool(true, "", inline = "LONDON", group = g_ORB)
+london_txt          = input.string("London ORB", "", inline = "LONDON", group = g_ORB)
+london_session      = input.session("0300-0315", "", inline = "LONDON", group = g_ORB)
+london_color        = input.color(color.red, "", inline = "LONDON", group = g_ORB)
+
+// Original NY
+use_ny              = input.bool(true, "", inline = "NY", group = g_ORB)
+ny_txt              = input.string("NY ORB", "", inline = "NY", group = g_ORB)
+ny_session          = input.session("0600-0615", "", inline = "NY", group = g_ORB)
+ny_color            = input.color(color.purple, "", inline = "NY", group = g_ORB)
+
+// Added NY 8:00
+use_ny2             = input.bool(true, "", inline = "NY2", group = g_ORB)
+ny2_txt             = input.string("NY ORB 8:00", "", inline = "NY2", group = g_ORB)
+ny2_session         = input.session("0800-0815", "", inline = "NY2", group = g_ORB)
+ny2_color           = input.color(color.orange, "", inline = "NY2", group = g_ORB)
+
+// Added NY 6:00
+use_ny3             = input.bool(true, "", inline = "NY3", group = g_ORB)
+ny3_txt             = input.string("NY ORB 6:00", "", inline = "NY3", group = g_ORB)
+ny3_session         = input.session("0915-0930", "", inline = "NY3", group = g_ORB)
+ny3_color           = input.color(color.teal, "", inline = "NY3", group = g_ORB)
+
+// Added NY 20:00
+use_ny4             = input.bool(true, "", inline = "NY4", group = g_ORB)
+ny4_txt             = input.string("NY ORB 20:00", "", inline = "NY4", group = g_ORB)
+ny4_session         = input.session("0015-0030", "", inline = "NY4", group = g_ORB)
+ny4_color           = input.color(color.navy, "", inline = "NY4", group = g_ORB)
+
+i_tracking_hours    = input.int(2, "Tracking Hours", minval = 1, maxval = 12, tooltip = "How many hours after ORB start to look for breakout entries", group = g_ORB)
+box_transparency    = input.int(80, "Box Transparency", 0, 100, group = g_ORB)
+text_transparency   = input.int(50, "Text Transparency", 0, 100, group = g_ORB)
+
+// ============================================================
+// SECTION 6: PIVOT LINES
+// ============================================================
+var g_PIVOTS        = "📏 Pivot Lines"
+show_pivots         = input.bool(true, "Show High/Low Lines", group = g_PIVOTS)
+show_pivot_labels   = input.bool(false, "Show Pivot Labels", group = g_PIVOTS)
+show_50_level       = input.bool(true, "Show 50% Level", group = g_PIVOTS)
+label_price         = input.bool(false, "Display Price on Labels", group = g_PIVOTS)
+orb_hi_str          = input.string("ORB.H", "High Label", inline = "piv_lbl", group = g_PIVOTS)
+orb_lo_str          = input.string("ORB.L", "Low Label", inline = "piv_lbl", group = g_PIVOTS)
+orb_50_str          = input.string("ORB.50", "50% Label", group = g_PIVOTS)
+fifty_color         = input.color(color.blue, "50% Level Color", group = g_PIVOTS)
+
+var piv_style = line.style_solid
+var fty_style = line.style_dashed
+var pivot_width = 1
+var fifty_width = 1
+
+// ============================================================
+// SECTION 7: TRADE FILTERS
+// ============================================================
+var g_FILTERS       = "🔍 Trade Filters"
+use_day_filter      = input.bool(false, "Enable Day Filter", group = g_FILTERS)
+trade_monday        = input.bool(true, "Monday", inline = "days1", group = g_FILTERS)
+trade_tuesday       = input.bool(true, "Tuesday", inline = "days1", group = g_FILTERS)
+trade_wednesday     = input.bool(true, "Wednesday", inline = "days2", group = g_FILTERS)
+trade_thursday      = input.bool(true, "Thursday", inline = "days2", group = g_FILTERS)
+trade_friday        = input.bool(true, "Friday", inline = "days3", group = g_FILTERS)
+
+// ============================================================
+// SECTION 8: ALERTS
+// ============================================================
+alert_entry         = input.bool(true, "Alert on Entry Signal", group = "🔔 Alerts")
+alert_tp            = input.bool(true, "Alert on TP Hit", group = "🔔 Alerts")
+alert_sl            = input.bool(true, "Alert on SL Hit", group = "🔔 Alerts")
+
+// ============================================================
+// MTF ORB LEVELS via request.security()
+// ============================================================
+// FIX 1: lookahead_on so the backtest sees the ORB complete at the same time as live.
+// Safe (no future data): the values are only read on the first bar AFTER the session,
+// where the high/low are already final and the "done" flag is purely time-based.
+f_orb_high(string sess, string tz) =>
+    in_sess = not na(time("", sess, tz))
+    var float _h = na
+    if in_sess
+        _h := na(_h) ? high : math.max(_h, high)
+    sess_started = in_sess and not in_sess[1]
+    if sess_started
+        _h := high
+    _h
+
+f_orb_low(string sess, string tz) =>
+    in_sess = not na(time("", sess, tz))
+    var float _l = na
+    if in_sess
+        _l := na(_l) ? low : math.min(_l, low)
+    sess_started = in_sess and not in_sess[1]
+    if sess_started
+        _l := low
+    _l
+
+f_orb_complete(string sess, string tz) =>
+    in_sess = not na(time("", sess, tz))
+    not in_sess and in_sess[1]
+
+[mtf_asia_high, mtf_asia_low, mtf_asia_done]       = request.security(syminfo.tickerid, orb_tf_lock, [f_orb_high(asia_session, i_timezone),   f_orb_low(asia_session, i_timezone),   f_orb_complete(asia_session, i_timezone)],   lookahead = barmerge.lookahead_on)
+[mtf_london_high, mtf_london_low, mtf_london_done] = request.security(syminfo.tickerid, orb_tf_lock, [f_orb_high(london_session, i_timezone), f_orb_low(london_session, i_timezone), f_orb_complete(london_session, i_timezone)], lookahead = barmerge.lookahead_on)
+[mtf_ny_high, mtf_ny_low, mtf_ny_done]             = request.security(syminfo.tickerid, orb_tf_lock, [f_orb_high(ny_session, i_timezone),     f_orb_low(ny_session, i_timezone),     f_orb_complete(ny_session, i_timezone)],     lookahead = barmerge.lookahead_on)
+[mtf_ny2_high, mtf_ny2_low, mtf_ny2_done]          = request.security(syminfo.tickerid, orb_tf_lock, [f_orb_high(ny2_session, i_timezone),    f_orb_low(ny2_session, i_timezone),    f_orb_complete(ny2_session, i_timezone)],    lookahead = barmerge.lookahead_on)
+[mtf_ny3_high, mtf_ny3_low, mtf_ny3_done]          = request.security(syminfo.tickerid, orb_tf_lock, [f_orb_high(ny3_session, i_timezone),    f_orb_low(ny3_session, i_timezone),    f_orb_complete(ny3_session, i_timezone)],    lookahead = barmerge.lookahead_on)
+[mtf_ny4_high, mtf_ny4_low, mtf_ny4_done]          = request.security(syminfo.tickerid, orb_tf_lock, [f_orb_high(ny4_session, i_timezone),    f_orb_low(ny4_session, i_timezone),    f_orb_complete(ny4_session, i_timezone)],    lookahead = barmerge.lookahead_on)
+
+// ============================================================
+// VARIABLES
+// ============================================================
+var transparent = #ffffff00
+
+t_asia   = not na(time("", asia_session, i_timezone))
+t_london = not na(time("", london_session, i_timezone))
+t_ny     = not na(time("", ny_session, i_timezone))
+t_ny2    = not na(time("", ny2_session, i_timezone))
+t_ny3    = not na(time("", ny3_session, i_timezone))
+t_ny4    = not na(time("", ny4_session, i_timezone))
+
+// same as NinjaScript: no new entries from the EOD close time until the 18:00 reopen
+eod_block_sess = str.substring(eod_close_session, 0, 4) + "-1800"
+eod_block = enable_eod_close and not na(time("", eod_block_sess, i_timezone))
+
+bar_hour = hour(time, i_timezone)
+bar_min = minute(time, i_timezone)
+bar_time_mins = bar_hour * 60 + bar_min
+
+parse_session_start(string sess) =>
+    start_str = str.substring(sess, 0, 4)
+    start_hour = int(str.tonumber(str.substring(start_str, 0, 2)))
+    start_min = int(str.tonumber(str.substring(start_str, 2, 4)))
+    start_hour * 60 + start_min
+
+parse_session_end(string sess) =>
+    end_str = str.substring(sess, 5, 9)
+    end_hour = int(str.tonumber(str.substring(end_str, 0, 2)))
+    end_min = int(str.tonumber(str.substring(end_str, 2, 4)))
+    end_hour * 60 + end_min
+
+asia_start_mins   = parse_session_start(asia_session)
+asia_end_mins     = parse_session_end(asia_session)
+london_start_mins = parse_session_start(london_session)
+london_end_mins   = parse_session_end(london_session)
+ny_start_mins     = parse_session_start(ny_session)
+ny_end_mins       = parse_session_end(ny_session)
+ny2_start_mins    = parse_session_start(ny2_session)
+ny2_end_mins      = parse_session_end(ny2_session)
+ny3_start_mins    = parse_session_start(ny3_session)
+ny3_end_mins      = parse_session_end(ny3_session)
+ny4_start_mins    = parse_session_start(ny4_session)
+ny4_end_mins      = parse_session_end(ny4_session)
+
+tf_mins     = timeframe.in_seconds() / 60
+// FIX 6: when ORB TF is locked, chart TF must be <= ORB TF, otherwise ORB levels are wrong -> no new trades
+chart_tf_ok = not use_orb_tf_lock or timeframe.in_seconds() <= timeframe.in_seconds(orb_tf_lock)
+buffer_mins = math.max(tf_mins, 30)
+
+t_asia_alt   = bar_time_mins >= asia_start_mins   and bar_time_mins < (asia_end_mins   + buffer_mins) and bar_time_mins[1] < asia_start_mins
+t_london_alt = bar_time_mins >= london_start_mins and bar_time_mins < (london_end_mins + buffer_mins) and bar_time_mins[1] < london_start_mins
+t_ny_alt     = bar_time_mins >= ny_start_mins     and bar_time_mins < (ny_end_mins     + buffer_mins) and bar_time_mins[1] < ny_start_mins
+t_ny2_alt    = bar_time_mins >= ny2_start_mins    and bar_time_mins < (ny2_end_mins    + buffer_mins) and bar_time_mins[1] < ny2_start_mins
+t_ny3_alt    = bar_time_mins >= ny3_start_mins    and bar_time_mins < (ny3_end_mins    + buffer_mins) and bar_time_mins[1] < ny3_start_mins
+t_ny4_alt    = bar_time_mins >= ny4_start_mins    and bar_time_mins < (ny4_end_mins    + buffer_mins) and bar_time_mins[1] < ny4_start_mins
+
+t_asia_final   = t_asia   ? t_asia   : (use_asia   and t_asia_alt)
+t_london_final = t_london ? t_london : (use_london and t_london_alt)
+t_ny_final     = t_ny     ? t_ny     : (use_ny     and t_ny_alt)
+t_ny2_final    = t_ny2    ? t_ny2    : (use_ny2    and t_ny2_alt)
+t_ny3_final    = t_ny3    ? t_ny3    : (use_ny3    and t_ny3_alt)
+t_ny4_final    = t_ny4    ? t_ny4    : (use_ny4    and t_ny4_alt)
+
+t_orb     = (use_asia and t_asia_final) or (use_london and t_london_final) or (use_ny and t_ny_final) or (use_ny2 and t_ny2_final) or (use_ny3 and t_ny3_final) or (use_ny4 and t_ny4_final)
+orb_start = t_orb and not t_orb[1]
+orb_end   = not t_orb and t_orb[1]
+
+get_current_session_info() =>
+    _color = color.purple
+    _txt = "ORB"
+    if use_asia and t_asia_final
+        _color := asia_color
+        _txt := asia_txt
+    else if use_london and t_london_final
+        _color := london_color
+        _txt := london_txt
+    else if use_ny and t_ny_final
+        _color := ny_color
+        _txt := ny_txt
+    else if use_ny2 and t_ny2_final
+        _color := ny2_color
+        _txt := ny2_txt
+    else if use_ny3 and t_ny3_final
+        _color := ny3_color
+        _txt := ny3_txt
+    else if use_ny4 and t_ny4_final
+        _color := ny4_color
+        _txt := ny4_txt
+    [_color, _txt]
+
+// ============================================================
+// ORB STATE VARIABLES (VARIP LATCHES ENABLED)
+// ============================================================
+var float orb_high = na
+var float orb_low = na
+var int orb_start_time = na
+var bool orb_active = false
+var bool orb_complete = false
+var color current_orb_color = color.purple
+var string current_orb_txt = "ORB"
+
+varip int breakout_count = 0
+varip float current_entry = na
+varip float current_sl = na
+varip float current_tp = na
+varip bool current_is_long = na
+varip bool trade_active = false
+varip int trade_start_bar = na
+
+varip bool price_returned_to_orb = false
+varip bool had_breakout_high = false
+varip bool had_breakout_low = false
+varip string last_trade_id = ""
+varip bool current_trade_skipped = false
+
+// T1 SL-Hit Re-entry State Variables
+varip bool t1_sl_hit = false
+varip float t1_sl_level = na
+varip bool t1_was_long = na
+varip int sl_check_closed_count = 0
+
+var box orb_box = na
+var line hi_line = na
+var line lo_line = na
+var line fifty_line = na
+var label hi_label = na
+var label lo_label = na
+var label fifty_label = na
+
+var line entry_line = na
+var line sl_line = na
+var line tp_line = na
+var box sl_box = na
+var box tp_box = na
+var label entry_label = na
+var label sl_label = na
+var label tp_label = na
+
+var box[] old_orb_boxes = array.new_box()
+var line[] old_hi_lines = array.new_line()
+var line[] old_lo_lines = array.new_line()
+var line[] old_fifty_lines = array.new_line()
+var label[] old_hi_labels = array.new_label()
+var label[] old_lo_labels = array.new_label()
+var label[] old_fifty_labels = array.new_label()
+var box[] old_sl_boxes = array.new_box()
+var box[] old_tp_boxes = array.new_box()
+var line[] old_entry_lines = array.new_line()
+var line[] old_sl_lines = array.new_line()
+var line[] old_tp_lines = array.new_line()
+var label[] old_entry_labels = array.new_label()
+var label[] old_sl_labels = array.new_label()
+var label[] old_tp_labels = array.new_label()
+
+var bool tracking_expired = false
+var label orb_tf_label = na
+
+// ============================================================
+// FUNCTIONS
+// ============================================================
+get_box_color(color c, int transp) =>
+    color.new(c, transp)
+
+passes_filters() =>
+    dow = dayofweek(time, i_timezone)
+    day_ok = true
+    if use_day_filter
+        if dow == 2
+            day_ok := trade_monday
+        else if dow == 3
+            day_ok := trade_tuesday
+        else if dow == 4
+            day_ok := trade_wednesday
+        else if dow == 5
+            day_ok := trade_thursday
+        else if dow == 6
+            day_ok := trade_friday
+        else
+            day_ok := false
+    day_ok
+
+cleanup_old_drawings(int max_count) =>
+    while old_orb_boxes.size() > max_count
+        old_orb_boxes.pop().delete()
+    while old_hi_lines.size() > max_count
+        old_hi_lines.pop().delete()
+    while old_lo_lines.size() > max_count
+        old_lo_lines.pop().delete()
+    while old_fifty_lines.size() > max_count
+        old_fifty_lines.pop().delete()
+    while old_hi_labels.size() > max_count
+        old_hi_labels.pop().delete()
+    while old_lo_labels.size() > max_count
+        old_lo_labels.pop().delete()
+    while old_fifty_labels.size() > max_count
+        old_fifty_labels.pop().delete()
+    while old_sl_boxes.size() > max_count * 4
+        old_sl_boxes.pop().delete()
+    while old_tp_boxes.size() > max_count * 4
+        old_tp_boxes.pop().delete()
+    while old_entry_lines.size() > max_count * 4
+        old_entry_lines.pop().delete()
+    while old_sl_lines.size() > max_count * 4
+        old_sl_lines.pop().delete()
+    while old_tp_lines.size() > max_count * 4
+        old_tp_lines.pop().delete()
+    while old_entry_labels.size() > max_count * 4
+        old_entry_labels.pop().delete()
+    while old_sl_labels.size() > max_count * 4
+        old_sl_labels.pop().delete()
+    while old_tp_labels.size() > max_count * 4
+        old_tp_labels.pop().delete()
+
+archive_trade_drawings() =>
+    if not na(entry_line)
+        old_entry_lines.unshift(entry_line)
+    if not na(sl_line)
+        old_sl_lines.unshift(sl_line)
+    if not na(tp_line)
+        old_tp_lines.unshift(tp_line)
+    if not na(entry_label)
+        old_entry_labels.unshift(entry_label)
+    if not na(sl_label)
+        old_sl_labels.unshift(sl_label)
+    if not na(tp_label)
+        old_tp_labels.unshift(tp_label)
+    if not na(sl_box)
+        old_sl_boxes.unshift(sl_box)
+    if not na(tp_box)
+        old_tp_boxes.unshift(tp_box)
+
+draw_trade(float entry, float sl, float tp, bool isLong, int startBar) =>
+    _entry_line = line.new(startBar, entry, startBar + max_trade_bars, entry, color = entry_color, style = line.style_solid, width = trade_line_width)
+    _sl_line    = line.new(startBar, sl,    startBar + max_trade_bars, sl,    color = sl_line_color, style = line.style_dashed, width = trade_line_width)
+    _tp_line    = line.new(startBar, tp,    startBar + max_trade_bars, tp,    color = tp_line_color, style = line.style_solid,  width = trade_line_width + 1)
+    
+    var label _entry_label = na
+    var label _sl_label    = na
+    var label _tp_label    = na
+    
+    if show_trade_labels
+        tp_label_txt = "TP " + str.tostring(tp, format.mintick)
+        if tp_mode == "Risk:Reward"
+            tp_label_txt += " (" + str.tostring(rr_ratio, "#.#") + "R)"
+        if (use_trail or use_2tick) and trail_rm_limit
+            tp_label_txt += " [TRAIL REF]"
+            
+        _entry_label := label.new(startBar + max_trade_bars, entry, "Entry " + str.tostring(entry, format.mintick), style = label.style_label_left, color = color.new(entry_color, 80), textcolor = entry_color, size = size.tiny)
+        _sl_label    := label.new(startBar + max_trade_bars, sl,    "SL "    + str.tostring(sl,    format.mintick), style = label.style_label_left, color = color.new(sl_line_color, 80), textcolor = sl_line_color, size = size.tiny)
+        _tp_label    := label.new(startBar + max_trade_bars, tp,    tp_label_txt, style = label.style_label_left, color = color.new(tp_line_color, 80), textcolor = tp_line_color, size = size.tiny)
+    
+    var box _sl_box = na
+    if show_sl_fill
+        slBoxTop = isLong ? entry : sl
+        slBoxBot = isLong ? sl : entry
+        _sl_box := box.new(startBar, slBoxTop, startBar + max_trade_bars, slBoxBot, bgcolor = sl_zone_color, border_color = na)
+    
+    var box _tp_box = na
+    if show_tp_fill
+        tpBoxTop = isLong ? tp : entry
+        tpBoxBot = isLong ? entry : tp
+        _tp_box := box.new(startBar, tpBoxTop, startBar + max_trade_bars, tpBoxBot, bgcolor = tp_zone_color, border_color = na)
+    
+    [_entry_line, _sl_line, _tp_line, _entry_label, _sl_label, _tp_label, _sl_box, _tp_box]
+
+// ============================================================
+// RESOLVE ORB LEVELS
+// ============================================================
+var float eff_orb_high = na
+var float eff_orb_low  = na
+var bool  eff_orb_ready = false
+
+mtf_asia_just_done   = use_orb_tf_lock and use_asia   and mtf_asia_done   and not mtf_asia_done[1]
+mtf_london_just_done = use_orb_tf_lock and use_london and mtf_london_done and not mtf_london_done[1]
+mtf_ny_just_done     = use_orb_tf_lock and use_ny     and mtf_ny_done     and not mtf_ny_done[1]
+mtf_ny2_just_done    = use_orb_tf_lock and use_ny2    and mtf_ny2_done    and not mtf_ny2_done[1]
+mtf_ny3_just_done    = use_orb_tf_lock and use_ny3    and mtf_ny3_done    and not mtf_ny3_done[1]
+mtf_ny4_just_done    = use_orb_tf_lock and use_ny4    and mtf_ny4_done    and not mtf_ny4_done[1]
+
+if mtf_asia_just_done
+    eff_orb_high  := mtf_asia_high
+    eff_orb_low   := mtf_asia_low
+    eff_orb_ready := true
+
+if mtf_london_just_done
+    eff_orb_high  := mtf_london_high
+    eff_orb_low   := mtf_london_low
+    eff_orb_ready := true
+
+if mtf_ny_just_done
+    eff_orb_high  := mtf_ny_high
+    eff_orb_low   := mtf_ny_low
+    eff_orb_ready := true
+
+if mtf_ny2_just_done
+    eff_orb_high  := mtf_ny2_high
+    eff_orb_low   := mtf_ny2_low
+    eff_orb_ready := true
+
+if mtf_ny3_just_done
+    eff_orb_high  := mtf_ny3_high
+    eff_orb_low   := mtf_ny3_low
+    eff_orb_ready := true
+
+if mtf_ny4_just_done
+    eff_orb_high  := mtf_ny4_high
+    eff_orb_low   := mtf_ny4_low
+    eff_orb_ready := true
+
+if orb_start
+    eff_orb_ready := false
+
+// ============================================================
+// MAIN LOGIC
+// ============================================================
+var bool long_signal  = false
+var bool short_signal = false
+var bool tp_signal    = false
+var bool sl_signal    = false
+
+long_signal  := false
+short_signal := false
+tp_signal    := false
+sl_signal    := false
+
+// Track real strategy closed trades to detect T1 SL hits before evaluating T2 re-entry
+if strategy.closedtrades > sl_check_closed_count
+    for i = sl_check_closed_count to strategy.closedtrades - 1
+        _cmt = strategy.closedtrades.exit_comment(i)
+        _eid = strategy.closedtrades.entry_id(i)
+        if breakout_count == 1 and (_eid == "T1_Long" or _eid == "T1_Short")
+            if _cmt == "SL"
+                t1_sl_hit := true
+            else
+                t1_sl_hit := false
+    sl_check_closed_count := strategy.closedtrades
+
+if timeframe.in_seconds("") <= timeframe.in_seconds(tf_limit)
+
+    if barstate.islast
+        if not na(orb_tf_label)
+            label.delete(orb_tf_label)
+        if use_orb_tf_lock
+            _tf_lbl_txt = "ORB TF: " + orb_tf_lock + "min" + (eff_orb_ready ? "\n✅ Locked" : "\n⏳ Forming") + (chart_tf_ok ? "" : "\n⚠ Chart TF > ORB TF - NO TRADES\nUse 1m or 5m chart")
+            orb_tf_label := label.new(bar_index, high * 1.0, _tf_lbl_txt, style = label.style_label_lower_left, color = color.new(color.teal, 70), textcolor = color.white, size = size.small)
+
+    // ==================== NEW ORB SESSION ====================
+    if orb_start
+        if not na(orb_box)
+            old_orb_boxes.unshift(orb_box)
+        if not na(hi_line)
+            old_hi_lines.unshift(hi_line)
+        if not na(lo_line)
+            old_lo_lines.unshift(lo_line)
+        if not na(fifty_line)
+            old_fifty_lines.unshift(fifty_line)
+        if not na(hi_label)
+            old_hi_labels.unshift(hi_label)
+        if not na(lo_label)
+            old_lo_labels.unshift(lo_label)
+        if not na(fifty_label)
+            old_fifty_labels.unshift(fifty_label)
+        
+        archive_trade_drawings()
+        
+        [sess_color, sess_txt] = get_current_session_info()
+        current_orb_color := sess_color
+        current_orb_txt   := sess_txt
+        
+        orb_high       := high
+        orb_low        := low
+        orb_start_time := time
+        orb_active     := true
+        orb_complete   := false
+        tracking_expired := false
+        
+        breakout_count := 0
+        trade_active   := false
+        current_entry  := na
+        current_sl     := na
+        current_tp     := na
+        current_is_long := na
+        
+        price_returned_to_orb := false
+        had_breakout_high := false
+        had_breakout_low  := false
+        last_trade_id     := ""
+        
+        t1_sl_hit   := false
+        t1_sl_level := na
+        t1_was_long := na
+        
+        entry_line  := na
+        sl_line     := na
+        tp_line     := na
+        entry_label := na
+        sl_label    := na
+        tp_label    := na
+        sl_box      := na
+        tp_box      := na
+        
+        orb_50 = (high + low) / 2
+        
+        if show_orb_box
+            _c = get_box_color(current_orb_color, box_transparency)
+            _t = get_box_color(current_orb_color, text_transparency)
+            orb_box := box.new(time, high, time, low, xloc = xloc.bar_time, border_color = _c, bgcolor = _c, text = show_orb_text ? current_orb_txt : na, text_color = _t, text_size = lbl_size)
+        
+        if show_pivots
+            hi_line := line.new(time, high, time, high, xloc = xloc.bar_time, style = piv_style, color = current_orb_color, width = pivot_width)
+            lo_line := line.new(time, low,  time, low,  xloc = xloc.bar_time, style = piv_style, color = current_orb_color, width = pivot_width)
+        
+        if show_50_level
+            fifty_line := line.new(time, orb_50, time, orb_50, xloc = xloc.bar_time, style = fty_style, color = fifty_color, width = fifty_width)
+        
+        if show_pivot_labels
+            _hi_txt = label_price ? str.format("{0} ({1})", orb_hi_str, str.tostring(high, format.mintick)) : orb_hi_str
+            _lo_txt = label_price ? str.format("{0} ({1})", orb_lo_str, str.tostring(low,  format.mintick)) : orb_lo_str
+            hi_label := label.new(time, high, _hi_txt, xloc = xloc.bar_time, color = transparent, textcolor = txt_color, style = label.style_label_down, size = lbl_size)
+            lo_label := label.new(time, low,  _lo_txt, xloc = xloc.bar_time, color = transparent, textcolor = txt_color, style = label.style_label_up,   size = lbl_size)
+        
+        if show_50_level and show_pivot_labels
+            _50_txt = label_price ? str.format("{0} ({1})", orb_50_str, str.tostring(orb_50, format.mintick)) : orb_50_str
+            fifty_label := label.new(time, orb_50, _50_txt, xloc = xloc.bar_time, color = transparent, textcolor = fifty_color, style = label.style_label_left, size = lbl_size)
+        
+        cleanup_old_drawings(max_days)
+    
+    // ==================== DURING ORB SESSION ====================
+    if orb_active and t_orb
+        orb_high := math.max(orb_high, high)
+        orb_low  := math.min(orb_low,  low)
+        orb_50    = (orb_high + orb_low) / 2
+        
+        if not na(orb_box) and show_orb_box
+            orb_box.set_right(time)
+            orb_box.set_top(orb_high)
+            orb_box.set_bottom(orb_low)
+        
+        if not na(hi_line) and show_pivots
+            hi_line.set_x2(time)
+            hi_line.set_y1(orb_high)
+            hi_line.set_y2(orb_high)
+            lo_line.set_x2(time)
+            lo_line.set_y1(orb_low)
+            lo_line.set_y2(orb_low)
+        
+        if not na(fifty_line) and show_50_level
+            fifty_line.set_x2(time)
+            fifty_line.set_y1(orb_50)
+            fifty_line.set_y2(orb_50)
+        
+        if not na(hi_label) and show_pivot_labels
+            hi_label.set_xy(time, orb_high)
+            lo_label.set_xy(time, orb_low)
+            if label_price
+                hi_label.set_text(str.format("{0} ({1})", orb_hi_str, str.tostring(orb_high, format.mintick)))
+                lo_label.set_text(str.format("{0} ({1})", orb_lo_str, str.tostring(orb_low,  format.mintick)))
+        
+        if not na(fifty_label) and show_50_level and show_pivot_labels
+            fifty_label.set_xy(time, orb_50)
+            if label_price
+                fifty_label.set_text(str.format("{0} ({1})", orb_50_str, str.tostring(orb_50, format.mintick)))
+    
+    // ==================== ORB SESSION ENDS ====================
+    if orb_end
+        orb_active   := false
+        orb_complete := true
+        
+        if not use_orb_tf_lock and passes_filters() and breakout_count < max_breakouts and strategy.position_size == 0 and not eod_block
+            if close > orb_high and barstate.isconfirmed
+                breakout_count  += 1
+                trade_active    := true
+                trade_start_bar := bar_index
+                current_is_long := true
+                had_breakout_high := true
+                price_returned_to_orb := false
+                
+                current_entry := close
+                current_sl    := sl_mode == "ORB Level" ? orb_low : low
+                sl_size        = current_entry - current_sl
+                
+                if breakout_count == 1
+                    t1_sl_level := low
+                    t1_was_long := true
+                    t1_sl_hit   := false
+                else
+                    t1_sl_hit   := false
+                
+                if tp_mode == "Risk:Reward"
+                    current_tp := current_entry + (sl_size * rr_ratio)
+                else if tp_mode == "Fixed Points/Ticks"
+                    current_tp := current_entry + (tp_ticks * syminfo.mintick)
+                else if tp_mode == "Fixed %"
+                    current_tp := current_entry * (1 + (tp_percent / 100))
+                    
+                long_signal   := true
+                
+                if show_trade_lines
+                    [el, sll, tpl, elab, sllab, tplab, slb, tpb] = draw_trade(current_entry, current_sl, current_tp, true, bar_index)
+                    entry_line := el
+                    sl_line    := sll
+                    tp_line    := tpl
+                    entry_label := elab
+                    sl_label    := sllab
+                    tp_label    := tplab
+                    sl_box      := slb
+                    tp_box      := tpb
+                
+                if show_entry_labels
+                    lbl_txt = "T" + str.tostring(breakout_count) + " LONG"
+                    label.new(bar_index, low, lbl_txt, color = color.green, textcolor = color.white, style = label.style_label_up, size = size.small)
+            
+            else if close < orb_low and barstate.isconfirmed
+                breakout_count  += 1
+                trade_active    := true
+                trade_start_bar := bar_index
+                current_is_long := false
+                had_breakout_low  := true
+                price_returned_to_orb := false
+                
+                current_entry := close
+                current_sl    := sl_mode == "ORB Level" ? orb_high : high
+                sl_size        = current_sl - current_entry
+                
+                if breakout_count == 1
+                    t1_sl_level := high
+                    t1_was_long := false
+                    t1_sl_hit   := false
+                else
+                    t1_sl_hit   := false
+                
+                if tp_mode == "Risk:Reward"
+                    current_tp := current_entry - (sl_size * rr_ratio)
+                else if tp_mode == "Fixed Points/Ticks"
+                    current_tp := current_entry - (tp_ticks * syminfo.mintick)
+                else if tp_mode == "Fixed %"
+                    current_tp := current_entry * (1 - (tp_percent / 100))
+                    
+                short_signal  := true
+                
+                if show_trade_lines
+                    [el, sll, tpl, elab, sllab, tplab, slb, tpb] = draw_trade(current_entry, current_sl, current_tp, false, bar_index)
+                    entry_line := el
+                    sl_line    := sll
+                    tp_line    := tpl
+                    entry_label := elab
+                    sl_label    := sllab
+                    tp_label    := tplab
+                    sl_box      := slb
+                    tp_box      := tpb
+                
+                if show_entry_labels
+                    lbl_txt = "T" + str.tostring(breakout_count) + " SHORT"
+                    label.new(bar_index, high, lbl_txt, color = color.red, textcolor = color.white, style = label.style_label_down, size = size.small)
+    
+    if use_orb_tf_lock and (mtf_asia_just_done or mtf_london_just_done or mtf_ny_just_done or mtf_ny2_just_done or mtf_ny3_just_done or mtf_ny4_just_done)
+        orb_complete := true
+        orb_high := eff_orb_high
+        orb_low  := eff_orb_low
+        if not na(hi_line) and show_pivots
+            hi_line.set_y1(eff_orb_high)
+            hi_line.set_y2(eff_orb_high)
+            lo_line.set_y1(eff_orb_low)
+            lo_line.set_y2(eff_orb_low)
+        if not na(fifty_line) and show_50_level
+            _50_locked = (eff_orb_high + eff_orb_low) / 2
+            fifty_line.set_y1(_50_locked)
+            fifty_line.set_y2(_50_locked)
+    
+    if orb_complete and not na(orb_start_time)
+        hours_since_orb_start = (time - orb_start_time) / (1000 * 60 * 60)
+        if hours_since_orb_start > i_tracking_hours
+            tracking_expired := true
+    
+    // ==================== BREAKOUT LOGIC (after ORB ends) ====================
+    active_orb_high = (use_orb_tf_lock and eff_orb_ready) ? eff_orb_high : orb_high
+    active_orb_low  = (use_orb_tf_lock and eff_orb_ready) ? eff_orb_low  : orb_low
+    breakout_orb_complete = use_orb_tf_lock ? (orb_complete and eff_orb_ready) : orb_complete
+
+    if breakout_orb_complete and not t_orb and not na(active_orb_high) and not na(active_orb_low)
+        if not na(hi_line) and show_pivots and not tracking_expired
+            hi_line.set_x2(time)
+        if not na(lo_line) and show_pivots and not tracking_expired
+            lo_line.set_x2(time)
+        if not na(fifty_line) and show_50_level and not tracking_expired
+            fifty_line.set_x2(time)
+        
+        // ==================== VISUAL TRADE MANAGEMENT ====================
+        if trade_active
+            bars_in_trade = bar_index - trade_start_bar
+            
+            if bars_in_trade <= max_trade_bars
+                extend_bar = math.min(bar_index + 5, trade_start_bar + max_trade_bars)
+                
+                if not na(entry_line)
+                    line.set_x2(entry_line, extend_bar)
+                if not na(sl_line)
+                    line.set_x2(sl_line, extend_bar)
+                if not na(tp_line)
+                    line.set_x2(tp_line, extend_bar)
+                if not na(sl_box)
+                    box.set_right(sl_box, extend_bar)
+                if not na(tp_box)
+                    box.set_right(tp_box, extend_bar)
+                if not na(entry_label)
+                    label.set_x(entry_label, extend_bar)
+                if not na(sl_label)
+                    label.set_x(sl_label, extend_bar)
+                if not na(tp_label)
+                    label.set_x(tp_label, extend_bar)
+            
+            if current_is_long
+                if high >= current_tp and bar_index > trade_start_bar
+                    tp_signal := true
+                    if show_trade_labels
+                        label.new(bar_index, current_tp, "✓ TP", style = label.style_label_down, color = color.new(tp_line_color, 50), textcolor = color.white, size = size.tiny)
+                    trade_active := false
+                else if low <= current_sl and bar_index > trade_start_bar
+                    sl_signal := true
+                    if show_trade_labels
+                        label.new(bar_index, current_sl, "✗ SL", style = label.style_label_up, color = color.new(sl_line_color, 50), textcolor = color.white, size = size.tiny)
+                    trade_active := false
+            else
+                if low <= current_tp and bar_index > trade_start_bar
+                    tp_signal := true
+                    if show_trade_labels
+                        label.new(bar_index, current_tp, "✓ TP", style = label.style_label_up, color = color.new(tp_line_color, 50), textcolor = color.white, size = size.tiny)
+                    trade_active := false
+                else if high >= current_sl and bar_index > trade_start_bar
+                    sl_signal := true
+                    if show_trade_labels
+                        label.new(bar_index, current_sl, "✗ SL", style = label.style_label_down, color = color.new(sl_line_color, 50), textcolor = color.white, size = size.tiny)
+                    trade_active := false
+            
+            if strategy.position_size == 0 and bar_index > trade_start_bar and not current_trade_skipped
+                trade_active := false
+
+        price_inside_orb = close >= active_orb_low  and close <= active_orb_high
+        price_above_orb  = close > active_orb_high and barstate.isconfirmed
+        price_below_orb  = close < active_orb_low and barstate.isconfirmed
+        
+        if (had_breakout_high and low  <= active_orb_high) or (had_breakout_low and high >= active_orb_low)
+            price_returned_to_orb := true
+        
+        // Strong 1st candle after the ORB: allowed to enter on that same candle (any chart timeframe)
+        _first_body_mode   = strong_first_mode == "Candle Body"
+        _first_bull_den    = _first_body_mode ? close - open : high - low
+        _first_bear_den    = _first_body_mode ? open - close : high - low
+        _first_bull_pct    = _first_bull_den > 0 ? math.min(100.0, (close - active_orb_high) / _first_bull_den * 100) : 0.0
+        _first_bear_pct    = _first_bear_den > 0 ? math.min(100.0, (active_orb_low - close) / _first_bear_den * 100) : 0.0
+        _first_check       = use_strong_first and use_orb_tf_lock and orb_end
+        strong_first_bull  = _first_check and close > active_orb_high and _first_bull_pct >= strong_first_pct
+        strong_first_bear  = _first_check and close < active_orb_low and _first_bear_pct >= strong_first_pct
+        if show_strong_info and _first_check and barstate.isconfirmed and (close > active_orb_high or close < active_orb_low)
+            _f_up  = close > active_orb_high
+            _f_pct = _f_up ? _first_bull_pct : _first_bear_pct
+            _f_ok  = _f_up ? strong_first_bull : strong_first_bear
+            label.new(bar_index, _f_up ? high : low, (_f_ok ? "STRONG 1st " : "WEAK 1st ") + str.tostring(_f_pct, "#") + "% (need " + str.tostring(strong_first_pct, "#") + "%)", color = color.new(_f_ok ? color.green : color.gray, 20), textcolor = color.white, style = _f_up ? label.style_label_down : label.style_label_up, size = size.tiny)
+        past_orb_end       = not orb_end or strong_first_bull or strong_first_bear
+        can_take_breakout  = breakout_count < max_breakouts and not tracking_expired and passes_filters() and past_orb_end and chart_tf_ok and strategy.position_size == 0 and not eod_block
+        
+        // LONG BREAKOUT
+        is_first_high_break   = not had_breakout_high and breakout_count == 0 and price_above_orb
+        sl_reentry_long_ok    = (t1_sl_hit and not t1_was_long and not na(t1_sl_level)) ? (close > t1_sl_level and barstate.isconfirmed) : price_above_orb
+        is_reentry_high_break = had_breakout_low and (not trade_active or (trade_active and not current_is_long)) and sl_reentry_long_ok
+        
+        if can_take_breakout and (is_first_high_break or is_reentry_high_break)
+            if trade_active or (breakout_count > 0 and not trade_active)
+                archive_trade_drawings()
+                entry_line  := na
+                sl_line     := na
+                tp_line     := na
+                entry_label := na
+                sl_label    := na
+                tp_label    := na
+                sl_box      := na
+                tp_box      := na
+            
+            breakout_count  += 1
+            trade_active    := true
+            trade_start_bar := bar_index
+            current_is_long := true
+            had_breakout_high := true
+            price_returned_to_orb := false
+            
+            current_entry := close
+            current_sl := sl_mode == "ORB Level" ? active_orb_low : low
+            sl_size     = current_entry - current_sl
+            
+            if breakout_count == 1
+                t1_sl_level := low
+                t1_was_long := true
+                t1_sl_hit   := false
+            else
+                t1_sl_hit   := false
+            
+            if tp_mode == "Risk:Reward"
+                current_tp := current_entry + (sl_size * rr_ratio)
+            else if tp_mode == "Fixed Points/Ticks"
+                current_tp := current_entry + (tp_ticks * syminfo.mintick)
+            else if tp_mode == "Fixed %"
+                current_tp := current_entry * (1 + (tp_percent / 100))
+
+            long_signal := true
+            
+            if show_trade_lines
+                [el, sll, tpl, elab, sllab, tplab, slb, tpb] = draw_trade(current_entry, current_sl, current_tp, true, bar_index)
+                entry_line  := el
+                sl_line     := sll
+                tp_line     := tpl
+                entry_label := elab
+                sl_label    := sllab
+                tp_label    := tplab
+                sl_box      := slb
+                tp_box      := tpb
+            
+            if show_entry_labels
+                lbl_txt = "T" + str.tostring(breakout_count) + " LONG"
+                label.new(bar_index, low, lbl_txt, color = color.green, textcolor = color.white, style = label.style_label_up, size = size.small)
+        
+        // SHORT BREAKOUT
+        is_first_low_break   = not had_breakout_low and breakout_count == 0 and price_below_orb
+        sl_reentry_short_ok  = (t1_sl_hit and t1_was_long and not na(t1_sl_level)) ? (close < t1_sl_level and barstate.isconfirmed) : price_below_orb
+        is_reentry_low_break = had_breakout_high and (not trade_active or (trade_active and current_is_long)) and sl_reentry_short_ok
+        
+        if can_take_breakout and (is_first_low_break or is_reentry_low_break)
+            if trade_active or (breakout_count > 0 and not trade_active)
+                archive_trade_drawings()
+                entry_line  := na
+                sl_line     := na
+                tp_line     := na
+                entry_label := na
+                sl_label    := na
+                tp_label    := na
+                sl_box      := na
+                tp_box      := na
+            
+            breakout_count  += 1
+            trade_active    := true
+            trade_start_bar := bar_index
+            current_is_long := false
+            had_breakout_low  := true
+            price_returned_to_orb := false
+            
+            current_entry := close
+            current_sl := sl_mode == "ORB Level" ? active_orb_high : high
+            sl_size     = current_sl - current_entry
+            
+            if breakout_count == 1
+                t1_sl_level := high
+                t1_was_long := false
+                t1_sl_hit   := false
+            else
+                t1_sl_hit   := false
+            
+            if tp_mode == "Risk:Reward"
+                current_tp := current_entry - (sl_size * rr_ratio)
+            else if tp_mode == "Fixed Points/Ticks"
+                current_tp := current_entry - (tp_ticks * syminfo.mintick)
+            else if tp_mode == "Fixed %"
+                current_tp := current_entry * (1 - (tp_percent / 100))
+                
+            short_signal := true
+            
+            if show_trade_lines
+                [el, sll, tpl, elab, sllab, tplab, slb, tpb] = draw_trade(current_entry, current_sl, current_tp, false, bar_index)
+                entry_line  := el
+                sl_line     := sll
+                tp_line     := tpl
+                entry_label := elab
+                sl_label    := sllab
+                tp_label    := tplab
+                sl_box      := slb
+                tp_box      := tpb
+            
+            if show_entry_labels
+                lbl_txt = "T" + str.tostring(breakout_count) + " SHORT"
+                label.new(bar_index, high, lbl_txt, color = color.red, textcolor = color.white, style = label.style_label_down, size = size.small)
+
+// Highlight breakout candle
+is_new_breakout = orb_complete and not t_orb and not tracking_expired and (long_signal or short_signal)
+barcolor(highlight_breakout and is_new_breakout ? breakout_candle_col : na)
+
+// ============================================================
+// STRATEGY EXECUTION ENGINE & RISK CALCULATION
+// ============================================================
+if close_on_new_orb and orb_start
+    strategy.close_all(comment = "New ORB Session")
+
+// EOD CLOSE LOGIC
+t_eod = not na(time("", eod_close_session, i_timezone))
+if enable_eod_close and t_eod and not t_eod[1]
+    strategy.close_all(comment = "EOD 15m Close")
+    trade_active := false
+
+// Futures Position Size Formula (Using Fixed USD Risk)
+get_position_size(entry_price, sl_price) =>
+    risk_amount = i_risk_usd
+    point_risk = math.abs(entry_price - sl_price)
+    risk_per_contract = point_risk * syminfo.pointvalue
+    
+    // Calculates exact amount, floors it for whole futures contracts
+    raw_qty = risk_per_contract > 0 ? (risk_amount / risk_per_contract) : 0
+    qty = math.floor(raw_qty)
+    
+    // Limits the output between min and max settings
+    math.max(i_min_contracts, math.min(qty, i_max_contracts))
+
+// Skip check: true when even 1 contract would risk more than the Risk Per Trade ($)
+is_risk_too_high(entry_price, sl_price) =>
+    risk_per_contract = math.abs(entry_price - sl_price) * syminfo.pointvalue
+    risk_per_contract > i_risk_usd
+
+if long_signal or short_signal
+    // FIX 4: stop equal to entry (zero risk) is an invalid trade -> always skipped
+    _zero_risk = math.abs(current_entry - current_sl) < syminfo.mintick * 0.5
+    // NEW: 2-Tick Method -> stop smaller than the minimum distance is skipped
+    _stop_ticks = math.round(math.abs(current_entry - current_sl) / syminfo.mintick)
+    _small_stop = use_2tick and not _zero_risk and min_stop_ticks > 0 and _stop_ticks < min_stop_ticks
+    current_trade_skipped := _zero_risk or _small_stop or (i_skip_high_risk and is_risk_too_high(current_entry, current_sl))
+    if current_trade_skipped
+        _risk_1c = math.abs(current_entry - current_sl) * syminfo.pointvalue
+        _skip_txt = _zero_risk ? "SKIP\nZero risk (SL = Entry)" : _small_stop ? "SKIP\nStop too small (" + str.tostring(_stop_ticks) + " ticks)" : "SKIP\n1c risk $" + str.tostring(_risk_1c, "#.##")
+        label.new(bar_index, long_signal ? low : high, _skip_txt, color = color.new(color.gray, 20), textcolor = color.white, style = long_signal ? label.style_label_up : label.style_label_down, size = size.tiny)
+
+// Strict execution latch: Prevents any duplicate strategy calls on the same breakout sequence
+if long_signal
+    trade_id = "T" + str.tostring(breakout_count) + "_Long"
+    
+    if last_trade_id != trade_id
+        last_trade_id := trade_id
+        
+        _qty = get_position_size(current_entry, current_sl)
+        sl_size = current_entry - current_sl
+        
+        _trail_on = use_2tick or use_trail
+        _limit = (_trail_on and trail_rm_limit) ? na : current_tp
+        // Original trailing stop (R-based) - used when the 2-Tick Method is OFF
+        _t_act_ticks = use_trail ? math.max(1, int(math.round((sl_size * trail_act_r) / syminfo.mintick))) : 0
+        _t_off_ticks = use_trail ? math.max(1, int(math.round((sl_size * trail_offset_r) / syminfo.mintick))) : 0
+        // NEW 2-Tick Method: start at 0.3R (never less than trail ticks + lock ticks), trail fixed ticks behind
+        if use_2tick
+            // live NinjaScript trail distance = larger of 'Trail Behind By' and 'Stop Safety Margin'
+            _eff_off = math.max(tick_off_ticks, stop_margin_ticks)
+            _t_off_ticks := _eff_off
+            _t_act_ticks := math.max(int(math.round((sl_size * tick_act_r) / syminfo.mintick)), _eff_off + math.max(lock_ticks, 1))
+        // stop measured from the actual fill (= NinjaScript 'Rebase SL/TP to Actual Fill')
+        _sl_ticks = math.max(1, int(math.round(sl_size / syminfo.mintick)))
+        
+        _trail_pts = _trail_on ? _t_act_ticks : na
+        _trail_off = _trail_on ? _t_off_ticks : na
+        
+        if not current_trade_skipped
+            strategy.entry(trade_id, strategy.long, qty = _qty)
+            strategy.exit("Exit_" + trade_id, from_entry = trade_id, loss = _sl_ticks, limit = _limit, trail_points = _trail_pts, trail_offset = _trail_off, comment_profit = "TP", comment_loss = "SL", comment_trailing = "TRAIL")
+        else if strategy.position_size < 0
+            // FIX 3: skipped reversal still closes the old opposite trade (same as a normal reversal would)
+            strategy.close_all(comment = "Reversal (Skipped)")
+
+if short_signal
+    trade_id = "T" + str.tostring(breakout_count) + "_Short"
+    
+    if last_trade_id != trade_id
+        last_trade_id := trade_id
+        
+        _qty = get_position_size(current_entry, current_sl)
+        sl_size = current_sl - current_entry
+        
+        _trail_on = use_2tick or use_trail
+        _limit = (_trail_on and trail_rm_limit) ? na : current_tp
+        // Original trailing stop (R-based) - used when the 2-Tick Method is OFF
+        _t_act_ticks = use_trail ? math.max(1, int(math.round((sl_size * trail_act_r) / syminfo.mintick))) : 0
+        _t_off_ticks = use_trail ? math.max(1, int(math.round((sl_size * trail_offset_r) / syminfo.mintick))) : 0
+        // NEW 2-Tick Method: start at 0.3R (never less than trail ticks + lock ticks), trail fixed ticks behind
+        if use_2tick
+            // live NinjaScript trail distance = larger of 'Trail Behind By' and 'Stop Safety Margin'
+            _eff_off = math.max(tick_off_ticks, stop_margin_ticks)
+            _t_off_ticks := _eff_off
+            _t_act_ticks := math.max(int(math.round((sl_size * tick_act_r) / syminfo.mintick)), _eff_off + math.max(lock_ticks, 1))
+        // stop measured from the actual fill (= NinjaScript 'Rebase SL/TP to Actual Fill')
+        _sl_ticks = math.max(1, int(math.round(sl_size / syminfo.mintick)))
+        
+        _trail_pts = _trail_on ? _t_act_ticks : na
+        _trail_off = _trail_on ? _t_off_ticks : na
+        
+        if not current_trade_skipped
+            strategy.entry(trade_id, strategy.short, qty = _qty)
+            strategy.exit("Exit_" + trade_id, from_entry = trade_id, loss = _sl_ticks, limit = _limit, trail_points = _trail_pts, trail_offset = _trail_off, comment_profit = "TP", comment_loss = "SL", comment_trailing = "TRAIL")
+        else if strategy.position_size > 0
+            // FIX 3: skipped reversal still closes the old opposite trade (same as a normal reversal would)
+            strategy.close_all(comment = "Reversal (Skipped)")
+
+// ============================================================
+// ALERTS
+// ============================================================
+if alert_entry and long_signal and not current_trade_skipped
+    alert("ORB T" + str.tostring(breakout_count) + " LONG | " + syminfo.ticker + " | Entry: " + str.tostring(current_entry, format.mintick) + " | SL: " + str.tostring(current_sl, format.mintick) + " | TP: " + str.tostring(current_tp, format.mintick), alert.freq_once_per_bar)
+
+if alert_entry and short_signal and not current_trade_skipped
+    alert("ORB T" + str.tostring(breakout_count) + " SHORT | " + syminfo.ticker + " | Entry: " + str.tostring(current_entry, format.mintick) + " | SL: " + str.tostring(current_sl, format.mintick) + " | TP: " + str.tostring(current_tp, format.mintick), alert.freq_once_per_bar)
+
+// FIX 2: TP / SL alerts now come from the REAL closed trades (works correctly with trailing stop)
+varip int alerted_closed_count = 0
+if strategy.closedtrades > alerted_closed_count
+    for i = alerted_closed_count to strategy.closedtrades - 1
+        _cmt = strategy.closedtrades.exit_comment(i)
+        _eid = strategy.closedtrades.entry_id(i)
+        _px  = str.tostring(strategy.closedtrades.exit_price(i), format.mintick)
+        _pnl = str.tostring(strategy.closedtrades.profit(i), "#.##")
+        _why = (na(_cmt) or _cmt == "") ? "Reversal" : _cmt
+        _msg = " | " + syminfo.ticker + " | " + _eid + " | Exit: " + _px + " | P/L $" + _pnl
+        if _why == "TP" or _why == "TRAIL"
+            if alert_tp
+                alert("ORB " + _why + " HIT" + _msg, alert.freq_all)
+        else if _why == "SL"
+            if alert_sl
+                alert("ORB SL HIT" + _msg, alert.freq_all)
+        else
+            if alert_tp or alert_sl
+                alert("ORB EXIT (" + _why + ")" + _msg, alert.freq_all)
+    alerted_closed_count := strategy.closedtrades
+
+// ============================================================
+// PLOT SIGNALS
+// ============================================================
+plotshape(long_signal,  title = "Long Signal",  location = location.belowbar, color = color.green, style = shape.triangleup,   size = size.small)
+plotshape(short_signal, title = "Short Signal", location = location.abovebar, color = color.red,   style = shape.triangledown, size = size.small)
+// ============================================================
+// INFO PANEL (NEW) - shows which exit method is running
+// ============================================================
+var table exit_info_tbl = table.new(position.top_right, 1, 1, bgcolor = color.new(color.black, 20), border_width = 1)
+if barstate.islast
+    _m_name = use_2tick ? "2-Tick Trail" : use_trail ? "Original Trailing Stop" : "Take Profit (" + tp_mode + ")"
+    table.cell(exit_info_tbl, 0, 0, "Exit Method: " + _m_name, text_color = color.white, text_size = size.small)
